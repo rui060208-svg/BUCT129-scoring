@@ -15,8 +15,8 @@ cat > "$app/Contents/Info.plist" <<'PLIST'
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleIconFile</key><string>AppIcon.icns</string>
   <key>LSUIElement</key><true/>
-  <key>CFBundleShortVersionString</key><string>2.1.0</string>
-  <key>CFBundleVersion</key><string>12</string>
+  <key>CFBundleShortVersionString</key><string>2.2.0</string>
+  <key>CFBundleVersion</key><string>13</string>
   <key>NSDesktopFolderUsageDescription</key><string>读取合唱比赛设置并保存评分、投票和登录记录。</string>
   <key>NSLocalNetworkUsageDescription</key><string>让同一比赛网络中的录分员连接本机计分台。</string>
 </dict>

@@ -26,6 +26,10 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .admin-list li:last-child{border-bottom:0}
 .admin-list time{display:block;color:var(--muted);font-size:12px}
 .admin-entry{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.score-conflicts{position:fixed;top:16px;right:16px;z-index:1000;width:min(430px,calc(100vw - 32px));max-height:70vh;overflow:auto;display:grid;gap:8px}
+.score-conflict{padding:12px 14px;border:1px solid #d8a15c;border-left:4px solid #b87725;border-radius:9px;background:#fff8e9;color:#5e3817;box-shadow:0 3px 13px #47202a24}
+.score-conflict header{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.score-conflict p{margin:6px 0 0;overflow-wrap:anywhere}
 .shared-link-panel{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .shared-link-panel input{width:min(100%,280px)}
 #staff-password{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
@@ -181,6 +185,7 @@ input::placeholder{color:#897c84}
 </style>
 </head>
 <body>
+<aside id="score-conflicts" class="score-conflicts" aria-label="录分冲突" hidden></aside>
 <p id="boot-error" class="boot-error" role="alert" hidden></p>
 <div class="shell" id="app-shell" hidden>
 <header class="header">
@@ -355,12 +360,16 @@ let owner = false;
 let selected = state.teams[0].id;
 let currentGroup = groups[0].key;
 let currentPage = "scores";
+let renderedScoreRoster = "";
 let currentFeature = featureAwards[0].key;
 const openGroups = new Set(["expert"]);
 let saveQueue = Promise.resolve();
 let pendingSaves = 0;
 let mutation = 0;
 let refreshing = false;
+let conflictCursor = 0;
+let conflictCursorKey = "";
+const shownConflicts = new Set();
 
 function setSaveStatus(label, error = false) {
   const status = el("save-status");
@@ -422,11 +431,24 @@ async function refreshSharedState() {
   refreshing = true;
   const startedAt = mutation;
   try {
-    const response = await request("/state");
-    const editing = document.activeElement?.matches("input,select");
-    if (startedAt === mutation && !pendingSaves && !editing && response.revision !== revision) {
+    const response = await request(`/state?after=${conflictCursor}`);
+    for (const notice of response.conflicts ?? []) showScoreConflict(notice);
+    if (response.conflictCursor !== undefined) {
+      conflictCursor = response.conflictCursor;
+      for (const id of shownConflicts) {
+        if (id <= conflictCursor) shownConflicts.delete(id);
+      }
+      try { sessionStorage.setItem(conflictCursorKey, String(conflictCursor)); } catch {}
+    }
+    const focused = document.activeElement;
+    const editing = focused?.matches("input,select");
+    const scorePage = currentPage === "scores";
+    const rosterChanged = scorePage && renderedScoreRoster !== rosterKey(response.state ?? state);
+    if (startedAt === mutation && !pendingSaves && (response.revision !== revision || rosterChanged)) {
+      if (editing && (!scorePage || (rosterChanged && hasDraft(focused)))) return;
       acceptState(response);
-      goTo(currentPage);
+      if (scorePage && !rosterChanged) updateScoreFields();
+      else goTo(currentPage);
     } else if (currentPage === "admin" && !editing) {
       await renderSessions();
     }
@@ -435,6 +457,32 @@ async function refreshSharedState() {
   } finally {
     refreshing = false;
   }
+}
+
+function rosterKey(data) {
+  return JSON.stringify([data?.teams.map(({id, name}) => [id, name]), data?.judges]);
+}
+
+function showScoreConflict(notice) {
+  if (notice.id <= conflictCursor || shownConflicts.has(notice.id)) return;
+  shownConflicts.add(notice.id);
+  const tray = el("score-conflicts");
+  const card = document.createElement("article");
+  card.className = "score-conflict";
+  card.setAttribute("role", "alert");
+  const scoreLabel = score => score === null ? "空白" : String(score);
+  card.innerHTML = `
+    <header><strong>分数录入冲突</strong><button class="btn small" type="button">关闭</button></header>
+    <p>${escapeHTML(notice.team)} · ${escapeHTML(notice.judge)}</p>
+    <p>${escapeHTML(notice.previousName)}已保存 <strong>${scoreLabel(notice.current)}</strong>，
+      ${escapeHTML(notice.proposedName)}提交 <strong>${scoreLabel(notice.proposed)}</strong>。</p>
+    <p>暂保留已保存的分数，请由管理员核对后更正。</p>`;
+  card.querySelector("button").addEventListener("click", () => {
+    card.remove();
+    tray.hidden = !tray.childElementCount;
+  });
+  tray.hidden = false;
+  tray.append(card);
 }
 
 async function renderSessions() {
@@ -534,6 +582,8 @@ function currentTeam() {
 function renderScorePage() {
   const row = calculateTeam(currentTeam());
   const { team } = row;
+  renderedScoreRoster = rosterKey(state);
+  el("score-panel").dataset.scoreTeam = team.id;
   const active = row.byGroup.find(entry => entry.group.key === currentGroup);
   const rows = active.judges.map(judge => {
     const score = team.ballots[judge.id];
@@ -800,15 +850,21 @@ function nextId(prefix, records) {
   return id;
 }
 
+function hasDraft(input) {
+  return Boolean(input.dataset.ballot || input.dataset.vote)
+    && (input.value !== input.dataset.original || input.validity.badInput);
+}
+
 function updateScoreFields(completed) {
   if (currentPage !== "scores") return;
   const team = currentTeam();
   const panel = el("score-panel");
+  if (panel.dataset.scoreTeam !== team.id) return;
   for (const input of panel.querySelectorAll("[data-ballot],[data-vote]")) {
-    if (input.dataset.pending || (input !== completed && document.activeElement === input)) continue;
+    if (input.dataset.pending || (input !== completed && document.activeElement === input && hasDraft(input))) continue;
     const id = input.dataset.ballot ?? input.dataset.vote;
     const value = input.dataset.ballot ? team.ballots[id] : team.votes?.[id];
-    input.value = value ?? "";
+    if (input.value !== String(value ?? "")) input.value = value ?? "";
     input.dataset.original = value ?? "";
     if (input.dataset.ballot) {
       panel.querySelector(`[data-ballot-status="${id}"]`).textContent = value == null ? "待录入" : "已录入";
@@ -829,7 +885,8 @@ async function commitCell(input) {
   }
   input.removeAttribute("aria-invalid");
   if (input.dataset.pending || value === previous) return;
-  const team = currentTeam();
+  const teamId = el("score-panel").dataset.scoreTeam;
+  const teamName = state.teams.find(item => item.id === teamId)?.name ?? "参赛单位";
   const judge = input.dataset.ballot ?? input.dataset.vote;
   input.dataset.pending = "true";
   if (isScoreInput) input.readOnly = true;
@@ -837,12 +894,13 @@ async function commitCell(input) {
   let conflict = null;
   try {
     await queueSave(async () => {
-      const response = await request("/cell", { team: team.id, judge, kind, previous, value });
+      const response = await request("/cell", { team: teamId, judge, kind, previous, value });
       acceptState(response);
       if (response.conflict) {
         const label = val => val === null ? "空白" : featureAwards.find(award => award.key === val)?.label ?? String(val);
         const judgeName = state.judges.find(item => item.id === judge)?.name ?? "";
-        conflict = `${team.name} · ${judgeName}。本次录入 ${label(value)}，另一位录分员已保存 ${label(response.current)}。请核对。`;
+        if (response.notice) showScoreConflict(response.notice);
+        else conflict = `${teamName} · ${judgeName}。本次录入 ${label(value)}，另一位录分员已保存 ${label(response.current)}。请核对。`;
         setSaveStatus("检测到录入冲突", true);
       } else {
         setSaveStatus("已保存到计分主机");
@@ -1094,6 +1152,8 @@ try {
   const response = await request("/state");
   role = response.role;
   owner = response.owner;
+  conflictCursorKey = `choir-conflicts:${response.role}:${response.name}`;
+  try { conflictCursor = Number(sessionStorage.getItem(conflictCursorKey)) || 0; } catch {}
   acceptState(response);
   if (!response.state && role === "admin") {
     acceptState(await request("/save", { state, revision }));
@@ -1104,7 +1164,8 @@ try {
   el("app-shell").hidden = false;
   setSaveStatus(response.state || role === "admin" ? "已连接计分主机" : "请等待管理员初始化名单");
   goTo("scores");
-  setInterval(refreshSharedState, 3000);
+  refreshSharedState();
+  setInterval(refreshSharedState, 1000);
 } catch (error) {
   el("boot-error").textContent = error.message;
   el("boot-error").hidden = false;

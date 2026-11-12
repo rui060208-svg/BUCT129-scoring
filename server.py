@@ -19,7 +19,7 @@ import unicodedata
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie, CookieError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 
 HERE = Path(__file__).resolve().parent
@@ -116,6 +116,12 @@ class ScoringServer(ThreadingHTTPServer):
         self.state = read_json(self.score_file, None)
         if self.state is not None and not valid_state(self.state):
             raise ValueError("自动备份格式有误，请先检查备份文件。")
+        self.activity = self.state.pop("_scoreActivity", {}) if self.state else {}
+        if not isinstance(self.activity, dict):
+            self.activity = {}
+        self.activity.setdefault("authors", {})
+        self.activity.setdefault("conflicts", [])
+        self.activity.setdefault("lastConflict", 0)
         self.logins = read_json(self.login_file, [])
         self.sessions = {}
         self.failures = {}
@@ -135,9 +141,28 @@ class ScoringServer(ThreadingHTTPServer):
         self.auth = settings
         self.sessions = {token: session for token, session in self.sessions.items() if not revoke(session)}
 
-    def save_state(self, state):
-        write_json(self.score_file, state)
+    def save_state(self, state, activity=None):
+        activity = self.activity if activity is None else activity
+        write_json(self.score_file, {**state, "_scoreActivity": activity})
         self.state = state
+        self.activity = activity
+
+    def add_score_conflict(self, team, judge, current, value, previous_author, submitter):
+        activity = self.activity
+        conflict_id = activity["lastConflict"] + 1
+        notice = {
+            "id": conflict_id, "team": team["name"], "judge": judge["name"],
+            "current": current, "proposed": value,
+            "previousName": previous_author["name"] if previous_author else "原录入人",
+            "proposedName": submitter["name"],
+        }
+        recipients = [score_actor(submitter)]
+        if previous_author:
+            recipients.append(previous_author["actor"])
+        entry = {"notice": notice, "recipients": recipients}
+        updated = {**activity, "lastConflict": conflict_id, "conflicts": [*activity["conflicts"][-199:], entry]}
+        self.save_state(self.state, updated)
+        return notice
 
     def snapshot(self):
         timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
@@ -233,8 +258,19 @@ class Request(BaseHTTPRequestHandler):
                 return self.respond(401, {"error": "请重新登录。"})
             if route == "/state":
                 state = self.scoring.state
-                return self.respond(200, {"state": state, "revision": revision(state), "role": session["role"],
-                                          "name": session["name"], "owner": self.is_owner(session)})
+                response = {"state": state, "revision": revision(state), "role": session["role"],
+                            "name": session["name"], "owner": self.is_owner(session)}
+                cursor = parse_qs(urlsplit(self.path).query).get("after", [""])[0]
+                if cursor.isascii() and cursor.isdecimal() and len(cursor) <= 16:
+                    last_seen = int(cursor)
+                    actor = score_actor(session)
+                    response["conflicts"] = [
+                        entry["notice"] for entry in self.scoring.activity["conflicts"]
+                        if entry["notice"]["id"] > last_seen
+                        and (session["role"] == "admin" or actor in entry["recipients"])
+                    ]
+                    response["conflictCursor"] = self.scoring.activity["lastConflict"]
+                return self.respond(200, response)
             if route == "/audit" and self.is_owner(session):
                 current = time.time()
                 online = [{"name": item["name"], "role": item["role"], "login": item["login"], "remote": item.get("remote", False)}
@@ -282,7 +318,7 @@ class Request(BaseHTTPRequestHandler):
                     del self.scoring.sessions[token]
                     return self.respond(200, {}, cookie=self.cookie("", 0))
                 if route == "/cell":
-                    return self.update_cell(data)
+                    return self.update_cell(data, session)
                 if session["role"] != "admin":
                     return self.respond(403, {"error": "此操作需要管理员权限。"})
                 if route == "/save":
@@ -347,19 +383,30 @@ class Request(BaseHTTPRequestHandler):
         data = request.get("state")
         if not valid_state(data):
             return self.respond(400, {"error": "参赛名单或备份格式不正确。"})
+        data.pop("_scoreActivity", None)
         if self.scoring.state != data and request.get("revision") != revision(self.scoring.state):
             return self.respond(409, {"error": "记录已更新，请重新核对后再操作。"})
-        self.scoring.save_state(data)
+        old_teams = {team["id"]: team["ballots"] for team in (self.scoring.state or {}).get("teams", [])}
+        new_teams = {team["id"]: team["ballots"] for team in data["teams"]}
+        judge_ids = {judge["id"] for judge in data["judges"]}
+        authors = {}
+        for cell, author in self.scoring.activity["authors"].items():
+            team_id, judge_id = cell.split("/", 1)
+            if (team_id in old_teams and team_id in new_teams and judge_id in judge_ids
+                    and old_teams[team_id].get(judge_id) == new_teams[team_id].get(judge_id)):
+                authors[cell] = author
+        self.scoring.save_state(data, {**self.scoring.activity, "authors": authors})
         self.respond(200, {"state": data, "revision": revision(data)})
 
-    def update_cell(self, data):
+    def update_cell(self, data, session):
         state = self.scoring.state
         kind = data.get("kind")
         value = data.get("value")
         if not state or kind not in ("ballots", "votes"):
             return self.respond(400, {"error": "请等待管理员初始化名单。"})
         judge_id = data.get("judge")
-        if (not any(judge["id"] == judge_id and judge["active"] for judge in state["judges"])
+        judge = next((item for item in state["judges"] if item["id"] == judge_id and item["active"]), None)
+        if (not judge
                 or ("value" not in data or "previous" not in data)
                 or (kind == "ballots" and not valid_score(value))
                 or (kind == "votes" and value is not None and (not isinstance(value, str) or value not in AWARDS))):
@@ -370,8 +417,16 @@ class Request(BaseHTTPRequestHandler):
         current = team.get(kind, {}).get(judge_id)
         if current == value:
             return self.respond(200, {"state": state, "revision": revision(state)})
-        if current != data["previous"]:
-            return self.respond(409, {"current": current, "state": state, "revision": revision(state)})
+        cell = f'{team["id"]}/{judge_id}'
+        previous_author = self.scoring.activity["authors"].get(cell)
+        actor = score_actor(session)
+        different_recorder = (kind == "ballots" and current is not None and session["role"] != "admin"
+                              and (not previous_author or previous_author["actor"] != actor))
+        if current != data["previous"] or different_recorder:
+            response = {"current": current, "state": state, "revision": revision(state)}
+            if kind == "ballots":
+                response["notice"] = self.scoring.add_score_conflict(team, judge, current, value, previous_author, session)
+            return self.respond(409, response)
         # The same lock covers comparison, durable write and publication to other sessions.
         updated = json.loads(json.dumps(state))
         record = next(item for item in updated["teams"] if item["id"] == team["id"]).setdefault(kind, {})
@@ -379,7 +434,12 @@ class Request(BaseHTTPRequestHandler):
             record.pop(judge_id, None)
         else:
             record[judge_id] = value
-        self.scoring.save_state(updated)
+        activity = self.scoring.activity
+        if kind == "ballots":
+            authors = {**activity["authors"]}
+            authors[cell] = {"actor": actor, "name": session["name"]}
+            activity = {**activity, "authors": authors}
+        self.scoring.save_state(updated, activity)
         self.respond(200, {"state": updated, "revision": revision(updated)})
 
     def change_staff_password(self, data):
@@ -429,6 +489,9 @@ class Request(BaseHTTPRequestHandler):
 def staff_key(name):
     return unicodedata.normalize("NFKC", name.strip()).casefold()
 
+
+def score_actor(session):
+    return f'{session["role"]}:{staff_key(session["name"])}'
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
