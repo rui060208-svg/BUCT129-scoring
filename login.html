@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录 · 合唱比赛计分台</title>
+<style>
+:root{font:15px/1.6 "PingFang SC","Microsoft YaHei",sans-serif;color:#2b2023;background:#f7f3ef}
+*{box-sizing:border-box}
+body{min-height:100vh;margin:0;display:grid;place-items:center;padding:18px}
+main{width:min(100%,410px);border:1px solid #e1d4d8;border-top:5px solid #741c3b;border-radius:13px;background:#fff;padding:30px}
+h1{font:800 29px/1.25 "Songti SC",serif;margin:0 0 20px;color:#5e1632}
+label{display:block;margin:12px 0 4px;font-weight:650}
+input,select,button{width:100%;font:inherit;border:1px solid #d5c8cb;border-radius:7px;background:white;padding:8px 10px;color:inherit}
+button{margin-top:17px;background:#741c3b;border-color:#741c3b;color:#fff;cursor:pointer}
+:focus-visible{outline:2px solid #741c3b;outline-offset:2px}
+#message{color:#9b243b;margin:10px 0 0;min-height:1.5em}
+</style>
+<main>
+  <h1>合唱比赛计分台</h1>
+  <form id="login">
+    <label for="role">登录身份</label>
+    <select id="role"><option value="staff">录分员</option><option value="admin">管理员</option></select>
+    <div id="name-row"><label for="name">姓名</label><input id="name" maxlength="50" autocomplete="name" required></div>
+    <label for="password">密码</label>
+    <input id="password" type="password" maxlength="256" autocomplete="current-password" required>
+    <button>登录</button>
+    <p id="message" role="alert"></p>
+  </form>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+if (location.hostname !== "127.0.0.1") {
+  $("role").querySelector('[value="admin"]').remove();
+}
+if (location.pathname === "/desktop" && location.hash) {
+  const key = location.hash.slice(1);
+  history.replaceState(null, "", "/");
+  fetch("/desktop-login", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({key})})
+    .then(response => {
+      if (!response.ok) throw Error();
+      location.replace("/app");
+    })
+    .catch(() => { $("message").textContent = "请从这台 Mac 的计分台应用重新打开，或使用密码登录。"; });
+}
+$("role").addEventListener("change", () => {
+  const admin = $("role").value === "admin";
+  $("name-row").hidden = admin;
+  $("name").required = !admin;
+  $("message").textContent = "";
+});
+$("login").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = event.target.querySelector("button");
+  button.disabled = true;
+  try {
+    const response = await fetch("/login", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({role:$("role").value,name:$("name").value,password:$("password").value})});
+    if (response.ok) location.replace("/app");
+    else $("message").textContent = (await response.json()).error;
+  } catch {
+    $("message").textContent = "无法连接计分台，请联系管理员。";
+  } finally {
+    button.disabled = false;
+  }
+});
+</script>
