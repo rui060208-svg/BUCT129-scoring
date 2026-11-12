@@ -29,9 +29,6 @@ button{margin-top:17px;background:#741c3b;border-color:#741c3b;color:#fff;cursor
 </main>
 <script>
 const $ = id => document.getElementById(id);
-if (location.hostname !== "127.0.0.1") {
-  $("role").querySelector('[value="admin"]').remove();
-}
 if (location.pathname === "/desktop" && location.hash) {
   const key = location.hash.slice(1);
   history.replaceState(null, "", "/");

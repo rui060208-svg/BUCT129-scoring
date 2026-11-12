@@ -26,6 +26,8 @@ button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visi
 .admin-list li:last-child{border-bottom:0}
 .admin-list time{display:block;color:var(--muted);font-size:12px}
 .admin-entry{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.shared-link-panel{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.shared-link-panel input{width:min(100%,280px)}
 #staff-password{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
 #staff-password input{font:inherit;padding:8px 10px;border:1px solid #d9ccd2;border-radius:7px;min-width:200px}
 #staff-password-note{margin:0 0 11px}
@@ -199,7 +201,7 @@ input::placeholder{color:#897c84}
   <button data-page="awards" data-admin-only>获奖展示</button>
   <button data-page="settings" data-admin-only>参赛与评委</button>
   <button data-page="rules" data-admin-only>计分规则</button>
-  <button data-page="admin" data-admin-only>登录管理</button>
+  <button data-page="admin" data-owner-only>登录管理</button>
 </nav>
 <main>
 <section id="scores">
@@ -264,10 +266,21 @@ input::placeholder{color:#897c84}
   </div>
 </section>
 <section id="admin" hidden>
-  <div class="title"><div><h2>登录管理</h2><p id="staff-access-note" role="status"></p></div><button id="staff-access-toggle" class="btn" type="button" disabled>暂停所有录分</button></div>
+  <div class="title"><div><h2>登录管理</h2><p id="shared-access-note" role="status"></p><p id="staff-access-note" role="status"></p></div>
+    <div class="actions">
+      <button id="shared-access-toggle" class="btn" type="button" disabled>暂停其他设备登录</button>
+      <button id="staff-access-toggle" class="btn" type="button" disabled>暂停所有录分</button>
+    </div>
+  </div>
+  <div id="staff-link-panel" class="note neutral section-note shared-link-panel" hidden>
+    <label for="staff-link">计分台登录地址</label>
+    <input id="staff-link" type="text" readonly>
+    <button id="copy-staff-link" class="btn small" type="button">复制登录链接</button>
+  </div>
+  <p id="staff-link-unavailable" class="muted section-note" hidden>暂无共享地址。连接比赛指定网络后，重新打开计分台。</p>
   <p id="staff-password-note" class="muted" role="status"></p>
   <form id="staff-password">
-    <input type="password" aria-label="新的录分密码" placeholder="新的录分密码，至少 8 位" autocomplete="new-password" minlength="8" maxlength="256" required>
+    <input type="password" aria-label="新的录分密码" placeholder="新的录分密码，至少 7 位" autocomplete="new-password" minlength="7" maxlength="256" required>
     <button class="btn primary">设置录分密码</button>
   </form>
   <div class="settings-grid">
@@ -338,6 +351,7 @@ function validateData(data) {
 let state = defaultData();
 let revision = "";
 let role = "staff";
+let owner = false;
 let selected = state.teams[0].id;
 let currentGroup = groups[0].key;
 let currentPage = "scores";
@@ -425,9 +439,12 @@ async function refreshSharedState() {
 
 async function renderSessions() {
   try {
-    const { online, logins, staffConfigured, staffEnabled, blocked } = await request("/audit");
+    const { online, logins, staffConfigured, staffEnabled, blocked, staffUrl, sharedEnabled } = await request("/audit");
+    el("staff-link-panel").hidden = !staffUrl;
+    el("staff-link-unavailable").hidden = Boolean(staffUrl);
+    el("staff-link").value = staffUrl ?? "";
     const render = (entries, controls = false) => entries.length ? entries.map(entry =>
-      `<li class="admin-entry"><div><strong>${escapeHTML(entry.name)}</strong> · ${entry.role === "admin" ? "管理员" : "录分员"}
+      `<li class="admin-entry"><div><strong>${escapeHTML(entry.name)}</strong> · ${entry.role === "admin" ? "管理员" : "录分员"}${entry.remote ? " · 其他设备" : ""}
         <time>${escapeHTML(new Date(entry.login).toLocaleString("zh-CN"))}</time></div>
         ${controls && entry.role === "staff" ? `<button class="btn small danger" data-stop-staff="${escapeHTML(entry.name)}">停用</button>` : ""}</li>`).join("")
       : '<li class="muted">暂无记录</li>';
@@ -440,6 +457,11 @@ async function renderSessions() {
     toggle.textContent = staffEnabled ? "暂停所有录分" : "恢复录分";
     toggle.dataset.staffEnabled = String(staffEnabled);
     toggle.disabled = false;
+    const sharedToggle = el("shared-access-toggle");
+    sharedToggle.textContent = sharedEnabled ? "暂停其他设备登录" : "恢复其他设备登录";
+    sharedToggle.dataset.sharedEnabled = String(sharedEnabled);
+    sharedToggle.disabled = false;
+    el("shared-access-note").textContent = sharedEnabled ? "其他设备可以登录。" : "其他设备登录已暂停。";
     el("staff-access-note").textContent = staffEnabled ? "录分员可用姓名和录分密码登录。" : "已暂停所有录分员登录和录入。";
     el("staff-password-note").textContent = staffConfigured
       ? "录分密码已设置。修改后，录分员需要重新登录。"
@@ -740,6 +762,7 @@ function renderSettings() {
 
 function goTo(page) {
   if (role !== "admin" && page !== "scores") return;
+  if (page === "admin" && !owner) return;
   currentPage = page;
   document.querySelectorAll("main > section").forEach(section => { section.hidden = section.id !== page; });
   document.querySelectorAll("[data-page]").forEach(button => {
@@ -912,6 +935,12 @@ document.addEventListener("click", event => {
     el("group-tabs").querySelector('[aria-pressed="true"]').focus();
   }
   if (role !== "admin") return;
+  if (button.id === "shared-access-toggle" && owner) {
+    button.disabled = true;
+    request("/shared-access", { enabled: data.sharedEnabled !== "true" })
+      .catch(error => setSaveStatus(error.message, true))
+      .finally(renderSessions);
+  }
   if (button.id === "staff-access-toggle") changeStaffAccess(data.staffEnabled !== "true");
   if (data.stopStaff) changeStaffAccess(false, data.stopStaff);
   if (data.resumeStaff) changeStaffAccess(true, data.resumeStaff);
@@ -1037,6 +1066,16 @@ el("logout").addEventListener("click", async () => {
   }
 });
 
+el("copy-staff-link").addEventListener("click", async () => {
+  const input = el("staff-link");
+  try {
+    await navigator.clipboard.writeText(input.value);
+    setSaveStatus("已复制登录链接");
+  } catch {
+    input.select();
+  }
+});
+
 el("staff-password").addEventListener("submit", async event => {
   event.preventDefault();
   const input = event.target.querySelector("input");
@@ -1054,11 +1093,13 @@ try {
   if (location.pathname !== "/app") throw Error("请通过管理员提供的计分台地址打开程序。");
   const response = await request("/state");
   role = response.role;
+  owner = response.owner;
   acceptState(response);
   if (!response.state && role === "admin") {
     acceptState(await request("/save", { state, revision }));
   }
   document.querySelectorAll("[data-admin-only]").forEach(button => { button.hidden = role !== "admin"; });
+  el("app-shell").querySelector("[data-owner-only]").hidden = !owner;
   el("session-name").textContent = response.name;
   el("app-shell").hidden = false;
   setSaveStatus(response.state || role === "admin" ? "已连接计分主机" : "请等待管理员初始化名单");

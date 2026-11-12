@@ -5,6 +5,7 @@ import fcntl
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -123,8 +124,11 @@ class ScoringServer(ThreadingHTTPServer):
         self.page = (HERE / "合唱比赛计分.html").read_bytes()
         self.login_page = (HERE / "login.html").read_bytes()
         super().__init__(address, Request)
+        self.scoring = self
         self.local_origin = f"http://127.0.0.1:{self.server_port}"
         self.shared_origin = origin
+        self.allowed_origins = (self.local_origin, self.shared_origin)
+        self.lan_origin = None
 
     def update_access(self, settings, revoke):
         write_json(self.auth_file, settings)
@@ -141,9 +145,23 @@ class ScoringServer(ThreadingHTTPServer):
         write_json(target, self.state)
 
 
+class RecorderListener(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, scoring):
+        super().__init__(address, Request)
+        self.scoring = scoring
+        self.origin = f"http://{address[0]}:{self.server_port}"
+        self.allowed_origins = (self.origin,)
+
+
 class Request(BaseHTTPRequestHandler):
     server_version = "Choir"
     sys_version = ""
+
+    @property
+    def scoring(self):
+        return self.server.scoring
 
     def setup(self):
         self.request.settimeout(15)
@@ -179,18 +197,18 @@ class Request(BaseHTTPRequestHandler):
             return None, None
         if not cookie:
             return None, None
-        session = self.server.sessions.get(cookie.value)
+        session = self.scoring.sessions.get(cookie.value)
         now = time.time()
         if not session or session["expires"] <= now:
-            self.server.sessions.pop(cookie.value, None)
+            self.scoring.sessions.pop(cookie.value, None)
             return None, None
-        if session["role"] == "admin" and self.request_origin != self.server.local_origin:
+        if session["origin"] != self.request_origin:
             return None, None
         session["seen"] = now
         return cookie.value, session
 
     def check_host(self):
-        for origin in (self.server.local_origin, self.server.shared_origin):
+        for origin in self.server.allowed_origins:
             if origin and self.headers.get("Host") == urlsplit(origin).netloc:
                 self.request_origin = origin
                 return True
@@ -201,30 +219,34 @@ class Request(BaseHTTPRequestHandler):
         if not self.check_host():
             return
         route = urlsplit(self.path).path
-        with self.server.lock:
+        with self.scoring.lock:
             _, session = self.session()
             if route == "/":
                 if session:
                     return self.respond(303, location="/app")
-                return self.respond(200, page=self.server.login_page)
-            if route == "/desktop" and self.server.desktop_key and self.request_origin == self.server.local_origin:
-                return self.respond(200, page=self.server.login_page)
+                return self.respond(200, page=self.scoring.login_page)
+            if route == "/desktop" and self.scoring.desktop_key and self.request_origin == self.scoring.local_origin:
+                return self.respond(200, page=self.scoring.login_page)
             if route == "/app":
-                return self.respond(200, page=self.server.page) if session else self.respond(303, location="/")
+                return self.respond(200, page=self.scoring.page) if session else self.respond(303, location="/")
             if not session:
                 return self.respond(401, {"error": "请重新登录。"})
             if route == "/state":
-                state = self.server.state
-                return self.respond(200, {"state": state, "revision": revision(state), "role": session["role"], "name": session["name"]})
-            if route == "/audit" and session["role"] == "admin":
+                state = self.scoring.state
+                return self.respond(200, {"state": state, "revision": revision(state), "role": session["role"],
+                                          "name": session["name"], "owner": self.is_owner(session)})
+            if route == "/audit" and self.is_owner(session):
                 current = time.time()
-                online = [{"name": item["name"], "role": item["role"], "login": item["login"]}
-                          for item in self.server.sessions.values()
+                online = [{"name": item["name"], "role": item["role"], "login": item["login"], "remote": item.get("remote", False)}
+                          for item in self.scoring.sessions.values()
                           if item["expires"] > current and current - item["seen"] <= ONLINE_SECONDS]
-                return self.respond(200, {"online": online, "logins": self.server.logins[-100:][::-1],
-                                          "staffConfigured": bool(self.server.auth.get("staff")),
-                                          "staffEnabled": self.server.auth.get("staffEnabled", True),
-                                          "blocked": list(self.server.auth.get("blocked", {}).values())})
+                staff_url = self.scoring.shared_origin or self.scoring.lan_origin
+                return self.respond(200, {"online": online, "logins": self.scoring.logins[-100:][::-1],
+                                          "staffConfigured": bool(self.scoring.auth.get("staff")),
+                                          "staffUrl": staff_url,
+                                          "sharedEnabled": self.scoring.auth.get("sharedEnabled", True),
+                                          "staffEnabled": self.scoring.auth.get("staffEnabled", True),
+                                          "blocked": list(self.scoring.auth.get("blocked", {}).values())})
             self.respond(404, {"error": "页面不存在。"})
 
     def do_POST(self):
@@ -243,21 +265,21 @@ class Request(BaseHTTPRequestHandler):
             return self.respond(400, {"error": "请求格式不正确。"})
         route = urlsplit(self.path).path
         try:
-            with self.server.lock:
+            with self.scoring.lock:
                 if route == "/login":
                     return self.login(data)
                 if route == "/desktop-login":
                     key = data.get("key")
-                    if (self.request_origin != self.server.local_origin or not self.server.desktop_key
+                    if (self.request_origin != self.scoring.local_origin or not self.scoring.desktop_key
                             or not isinstance(key, str) or not key.isascii()
-                            or not hmac.compare_digest(key, self.server.desktop_key)):
+                            or not hmac.compare_digest(key, self.scoring.desktop_key)):
                         return self.respond(403, {"error": "请从这台 Mac 的桌面应用打开。"})
                     return self.create_session("admin", "管理员")
                 token, session = self.session()
                 if not session:
                     return self.respond(401, {"error": "请重新登录。"})
                 if route == "/logout":
-                    del self.server.sessions[token]
+                    del self.scoring.sessions[token]
                     return self.respond(200, {}, cookie=self.cookie("", 0))
                 if route == "/cell":
                     return self.update_cell(data)
@@ -266,12 +288,16 @@ class Request(BaseHTTPRequestHandler):
                 if route == "/save":
                     return self.replace_state(data)
                 if route == "/snapshot":
-                    self.server.snapshot()
+                    self.scoring.snapshot()
                     return self.respond(200, {})
-                if route == "/staff-password":
-                    return self.change_staff_password(data)
-                if route == "/staff-access":
-                    return self.change_staff_access(data)
+                if route in ("/staff-password", "/staff-access", "/shared-access"):
+                    if not self.is_owner(session):
+                        return self.respond(403, {"error": "登录权限只能在计分主机上管理。"})
+                    if route == "/staff-password":
+                        return self.change_staff_password(data)
+                    if route == "/staff-access":
+                        return self.change_staff_access(data)
+                    return self.change_shared_access(data)
                 return self.respond(404, {"error": "页面不存在。"})
         except (OSError, ValueError, TypeError):
             return self.respond(400, {"error": "保存失败，请检查数据格式和主机文件夹。"})
@@ -280,23 +306,23 @@ class Request(BaseHTTPRequestHandler):
         role, password, name = data.get("role"), data.get("password"), data.get("name")
         if role not in ("admin", "staff") or not isinstance(password, str) or len(password) > 256:
             return self.respond(400, {"error": "请输入有效密码。"})
-        if role == "admin" and self.request_origin != self.server.local_origin:
-            return self.respond(403, {"error": "管理员只能在计分主机登录。"})
+        if self.request_origin != self.scoring.local_origin and not self.scoring.auth.get("sharedEnabled", True):
+            return self.respond(403, {"error": "计分主机已暂停其他设备登录。"})
         if role == "staff" and (not isinstance(name, str) or not 1 <= len(name.strip()) <= 50
                                 or any(ord(char) < 32 for char in name)):
             return self.respond(400, {"error": "请输入你的姓名。"})
         current = time.time()
         address = self.client_address[0]
-        failures = [stamp for stamp in self.server.failures.get(address, []) if current - stamp < 60]
+        failures = [stamp for stamp in self.scoring.failures.get(address, []) if current - stamp < 60]
         if len(failures) >= 10:
             return self.respond(429, {"error": "尝试过多，请稍等一分钟。"})
-        if not matches_password(password, self.server.auth.get(role)):
-            self.server.failures[address] = [*failures, current]
+        if not matches_password(password, self.scoring.auth.get(role)):
+            self.scoring.failures[address] = [*failures, current]
             return self.respond(401, {"error": "密码错误，或管理员尚未设置录分密码。"})
-        self.server.failures.pop(address, None)
+        self.scoring.failures.pop(address, None)
         name = "管理员" if role == "admin" else name.strip()
-        if role == "staff" and (not self.server.auth.get("staffEnabled", True)
-                                or staff_key(name) in self.server.auth.get("blocked", {})):
+        if role == "staff" and (not self.scoring.auth.get("staffEnabled", True)
+                                or staff_key(name) in self.scoring.auth.get("blocked", {})):
             return self.respond(403, {"error": "管理员已暂停此录分权限。"})
         self.create_session(role, name)
 
@@ -304,28 +330,30 @@ class Request(BaseHTTPRequestHandler):
         current = time.time()
         prior, _ = self.session()
         if prior:
-            self.server.sessions.pop(prior, None)
-        entry = {"name": name, "role": role, "login": now_text()}
-        write_json(self.server.login_file, [*self.server.logins, entry])
-        self.server.logins.append(entry)
-        for token in list(self.server.sessions):
-            if self.server.sessions[token]["expires"] <= current:
-                del self.server.sessions[token]
+            self.scoring.sessions.pop(prior, None)
+        entry = {"name": name, "role": role, "login": now_text(),
+                 "remote": self.request_origin != self.scoring.local_origin}
+        write_json(self.scoring.login_file, [*self.scoring.logins, entry])
+        self.scoring.logins.append(entry)
+        for token in list(self.scoring.sessions):
+            if self.scoring.sessions[token]["expires"] <= current:
+                del self.scoring.sessions[token]
         token = secrets.token_urlsafe(32)
-        self.server.sessions[token] = {**entry, "seen": current, "expires": current + SESSION_SECONDS}
+        self.scoring.sessions[token] = {**entry, "origin": self.request_origin,
+                                        "seen": current, "expires": current + SESSION_SECONDS}
         self.respond(200, {}, cookie=self.cookie(token, SESSION_SECONDS))
 
     def replace_state(self, request):
         data = request.get("state")
         if not valid_state(data):
             return self.respond(400, {"error": "参赛名单或备份格式不正确。"})
-        if self.server.state != data and request.get("revision") != revision(self.server.state):
+        if self.scoring.state != data and request.get("revision") != revision(self.scoring.state):
             return self.respond(409, {"error": "记录已更新，请重新核对后再操作。"})
-        self.server.save_state(data)
+        self.scoring.save_state(data)
         self.respond(200, {"state": data, "revision": revision(data)})
 
     def update_cell(self, data):
-        state = self.server.state
+        state = self.scoring.state
         kind = data.get("kind")
         value = data.get("value")
         if not state or kind not in ("ballots", "votes"):
@@ -351,17 +379,17 @@ class Request(BaseHTTPRequestHandler):
             record.pop(judge_id, None)
         else:
             record[judge_id] = value
-        self.server.save_state(updated)
+        self.scoring.save_state(updated)
         self.respond(200, {"state": updated, "revision": revision(updated)})
 
     def change_staff_password(self, data):
         password = data.get("password")
-        if not isinstance(password, str) or not 8 <= len(password) <= 256:
-            return self.respond(400, {"error": "录分密码须至少 8 位。"})
-        if matches_password(password, self.server.auth["admin"]):
+        if not isinstance(password, str) or not 7 <= len(password) <= 256:
+            return self.respond(400, {"error": "录分密码须至少 7 位。"})
+        if matches_password(password, self.scoring.auth["admin"]):
             return self.respond(400, {"error": "请为录分员设置一个独立的密码。"})
-        updated = {**self.server.auth, "staff": password_hash(password)}
-        self.server.update_access(updated, lambda session: session["role"] == "staff")
+        updated = {**self.scoring.auth, "staff": password_hash(password)}
+        self.scoring.update_access(updated, lambda session: session["role"] == "staff")
         self.respond(200, {})
 
     def change_staff_access(self, data):
@@ -370,20 +398,31 @@ class Request(BaseHTTPRequestHandler):
             return self.respond(400, {"error": "请指定是否允许录分。"})
         name = data.get("name")
         if name is None:
-            settings = {**self.server.auth, "staffEnabled": enabled}
-            self.server.update_access(settings, lambda session: not enabled and session["role"] == "staff")
+            settings = {**self.scoring.auth, "staffEnabled": enabled}
+            self.scoring.update_access(settings, lambda session: not enabled and session["role"] == "staff")
         else:
             if not isinstance(name, str) or not 1 <= len(name.strip()) <= 50:
                 return self.respond(400, {"error": "姓名格式不正确。"})
             key = staff_key(name)
-            blocked = {**self.server.auth.get("blocked", {})}
+            blocked = {**self.scoring.auth.get("blocked", {})}
             if enabled:
                 blocked.pop(key, None)
             else:
                 blocked[key] = name.strip()
-            settings = {**self.server.auth, "blocked": blocked}
-            self.server.update_access(settings, lambda session:
+            settings = {**self.scoring.auth, "blocked": blocked}
+            self.scoring.update_access(settings, lambda session:
                                       not enabled and session["role"] == "staff" and staff_key(session["name"]) == key)
+        self.respond(200, {})
+
+    def is_owner(self, session):
+        return session["role"] == "admin" and self.request_origin == self.scoring.local_origin
+
+    def change_shared_access(self, data):
+        enabled = data.get("enabled")
+        if type(enabled) is not bool:
+            return self.respond(400, {"error": "请指定是否允许其他设备登录。"})
+        settings = {**self.scoring.auth, "sharedEnabled": enabled}
+        self.scoring.update_access(settings, lambda session: not enabled and session["remote"])
         self.respond(200, {})
 
 
@@ -397,14 +436,17 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=Path.home() / ".choir129")
     parser.add_argument("--port", type=int, default=8789)
     parser.add_argument("--origin", help="HTTPS address from a reverse proxy on this computer")
+    parser.add_argument("--lan-host", help="Private IPv4 address for a recorder-only listener")
+    parser.add_argument("--lan-port", type=int, default=8789)
     parser.add_argument("--parent-pid", type=int, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.command in ("set-admin", "set-staff"):
         role = "admin" if args.command == "set-admin" else "staff"
         label = "管理密码" if role == "admin" else "录分密码"
         password = getpass.getpass(f"{label}：")
-        if len(password) < 8 or len(password) > 256 or password != getpass.getpass(f"再次输入{label}："):
-            parser.error("两次密码须一致，且长度为 8 至 256 位。")
+        minimum = 8 if role == "admin" else 7
+        if len(password) < minimum or len(password) > 256 or password != getpass.getpass(f"再次输入{label}："):
+            parser.error(f"两次密码须一致，且长度为 {minimum} 至 256 位。")
         path = args.data_dir / ".choir-auth.json"
         auth = read_json(path, {})
         if matches_password(password, auth.get("staff" if role == "admin" else "admin")):
@@ -416,6 +458,14 @@ def main():
         parsed = urlsplit(args.origin)
         if parsed.scheme != "https" or not parsed.netloc or parsed.path or parsed.query or parsed.fragment or parsed.username:
             parser.error("--origin 必须是无路径的 HTTPS 地址。")
+    if args.lan_host:
+        try:
+            ip = ipaddress.IPv4Address(args.lan_host)
+            private_networks = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+            if not any(ip in ipaddress.IPv4Network(network) for network in private_networks):
+                raise ValueError()
+        except ValueError:
+            parser.error("--lan-host 必须是本机的私有 IPv4 地址。")
     args.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (args.data_dir / ".choir-server.lock").open("a") as lock:
         try:
@@ -424,6 +474,18 @@ def main():
             parser.error("该数据目录已有一个计分服务，请打开正在运行的服务。")
         desktop_key = os.environ.pop("CHOIR_DESKTOP_KEY", None) if args.parent_pid and not args.origin else None
         with ScoringServer(("127.0.0.1", args.port), args.data_dir, args.origin, desktop_key) as server:
+            recorders = None
+            if args.lan_host:
+                try:
+                    recorders = RecorderListener((args.lan_host, args.lan_port), server)
+                except OSError:
+                    try:
+                        recorders = RecorderListener((args.lan_host, 0), server)
+                    except OSError:
+                        pass
+                if recorders:
+                    server.lan_origin = recorders.origin
+                    threading.Thread(target=recorders.serve_forever, daemon=True).start()
             if args.parent_pid:
                 def stop_when_launcher_exits():
                     while os.getppid() == args.parent_pid:
@@ -431,7 +493,14 @@ def main():
                     server.shutdown()
                 threading.Thread(target=stop_when_launcher_exits, daemon=True).start()
             print(server.local_origin, flush=True)
-            server.serve_forever()
+            if recorders:
+                print(recorders.origin, flush=True)
+            try:
+                server.serve_forever()
+            finally:
+                if recorders:
+                    recorders.shutdown()
+                    recorders.server_close()
 
 
 if __name__ == "__main__":

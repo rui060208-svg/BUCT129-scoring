@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let dataDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -20,6 +21,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server.executableURL = python
         server.arguments = [script.path, "serve", "--data-dir", dataDirectory.path, "--port", "0",
                             "--parent-pid", String(ProcessInfo.processInfo.processIdentifier)]
+        if let privateAddress = privateIPv4Address() {
+            server.arguments?.append(contentsOf: ["--lan-host", privateAddress])
+        }
         var environment = ProcessInfo.processInfo.environment
         environment["CHOIR_DESKTOP_KEY"] = desktopKey
         server.environment = environment
@@ -59,6 +63,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         if let server, server.isRunning { server.terminate() }
+    }
+
+    private func privateIPv4Address() -> String? {
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let interfaces else { return nil }
+        defer { freeifaddrs(interfaces) }
+
+        var candidates: [(name: String, address: String)] = []
+        var current: UnsafeMutablePointer<ifaddrs>? = interfaces
+        while let pointer = current {
+            let interface = pointer.pointee
+            current = interface.ifa_next
+            let name = String(cString: interface.ifa_name)
+            guard name.hasPrefix("en"), interface.ifa_flags & UInt32(IFF_RUNNING) != 0,
+                  interface.ifa_flags & UInt32(IFF_UP) != 0, let address = interface.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else { continue }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(address, socklen_t(address.pointee.sa_len), &host, socklen_t(host.count),
+                              nil, 0, NI_NUMERICHOST) == 0 else { continue }
+            let value = String(cString: host)
+            let octets = value.split(separator: ".").compactMap { Int($0) }
+            guard octets.count == 4 else { continue }
+            if octets[0] == 10 || (octets[0] == 172 && (16...31).contains(octets[1]))
+                || (octets[0] == 192 && octets[1] == 168) {
+                candidates.append((name, value))
+            }
+        }
+        return candidates.sorted { $0.name.compare($1.name, options: .numeric) == .orderedAscending }.first?.address
     }
 
     private func pythonExecutable() -> URL? {
